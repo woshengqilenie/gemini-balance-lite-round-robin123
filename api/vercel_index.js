@@ -1,4 +1,4 @@
-// /api/vercel_index.js (Round-Robin with REST API & Health Checks)
+// /api/vercel_index.js (Final Round-Robin with Corrected REST API & Health Checks)
 
 export const config = {
   runtime: 'edge',
@@ -22,7 +22,7 @@ export default async function handleRequest(request) {
     return new Response('Proxy is Running!');
   }
 
-  const targetUrl = `https.generativelanguage.googleapis.com${pathname}${search}`;
+  const targetUrl = `https://generativelanguage.googleapis.com${pathname}${search}`;
 
   try {
     // --- Security Checkpoint ---
@@ -36,22 +36,30 @@ export default async function handleRequest(request) {
     // --- Round-Robin Load Balancing Logic ---
     const serverKeyPool = process.env.GEMINI_API_KEYS;
     if (!serverKeyPool) {
-        return new Response(JSON.stringify({ error: { message: 'Server configuration error: Key pool is not set.' } }), { status: 500 });
+        return new Response(JSON.stringify({ error: { message: 'Server configuration error: Key pool is not set.' } }), { status: 500, headers: {'Content-Type': 'application/json'} });
     }
 
     const apiKeys = serverKeyPool.split(',').map(k => k.trim()).filter(k => k);
     if (apiKeys.length === 0) {
-        return new Response(JSON.stringify({ error: { message: 'Server configuration error: Key pool is empty.' } }), { status: 500 });
+        return new Response(JSON.stringify({ error: { message: 'Server configuration error: Key pool is empty.' } }), { status: 500, headers: {'Content-Type': 'application/json'} });
     }
     
+    // 1. 通过 fetch 从 KV 读取当前索引
     const readResponse = await fetch(`${KV_URL}/get/gemini_rr_index`, {
         headers: { 'Authorization': `Bearer ${KV_TOKEN}` }
     });
+    
+    if (!readResponse.ok) {
+        const errorText = await readResponse.text();
+        console.error("Failed to read from KV:", errorText);
+        // 如果读取失败，我们可以默认从 0 开始，而不是中断服务
+    }
+
     const readResult = await readResponse.json();
     let currentIndex = readResult.result ? parseInt(readResult.result, 10) : 0;
     
-    // 增加一个额外的边界检查，防止索引越界
-    if (currentIndex >= apiKeys.length) {
+    // 增加一个额外的边界检查，防止因密钥池缩减导致索引越界
+    if (isNaN(currentIndex) || currentIndex >= apiKeys.length) {
         currentIndex = 0;
     }
 
@@ -59,11 +67,18 @@ export default async function handleRequest(request) {
     
     const nextIndex = (currentIndex + 1) % apiKeys.length;
 
-    // fire-and-forget
-    fetch(`${KV_URL}/set/gemini_rr_index/${nextIndex}`, {
-        headers: { 'Authorization': `Bearer ${KV_TOKEN}` },
-        method: 'POST',
+    // 2. 【最终修复】通过 fetch 将下一个索引写回 KV
+    // Upstash REST API 的 SET 命令格式为: /set/[key]/[value]
+    // 它使用 GET 或 POST 方法都可以工作
+    const writePromise = fetch(`${KV_URL}/set/gemini_rr_index/${nextIndex}`, {
+        method: 'POST', // 使用 POST 更符合 RESTful 规范
+        headers: { 
+            'Authorization': `Bearer ${KV_TOKEN}`
+        }
     });
+
+    // 为了不阻塞主流程（降低延迟），我们不 await 它，但在后台处理它的错误
+    writePromise.catch(err => console.error("Error writing to KV:", err));
 
     console.log(`Round-Robin: Using key at index ${currentIndex}. Next index will be ${nextIndex}.`);
 
@@ -81,7 +96,7 @@ export default async function handleRequest(request) {
       body: request.body
     });
 
-    // ... (response handling)
+    // --- 清理并返回响应 ---
     const responseHeaders = new Headers(response.headers);
     responseHeaders.delete('transfer-encoding');
     responseHeaders.delete('connection');
@@ -96,6 +111,6 @@ export default async function handleRequest(request) {
 
   } catch (error) {
    console.error('Failed to fetch:', error);
-   return new Response('Internal Server Error\n' + error?.stack, { status: 500 });
+   return new Response('Internal Server Error\n' + error?.stack, { status: 500, headers: {'Content-Type': 'text/plain'} });
   }
 }
